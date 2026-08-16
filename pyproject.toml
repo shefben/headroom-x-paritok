@@ -141,6 +141,18 @@ memory = [
 vector = [
     "hnswlib>=0.8.0",
 ]
+# Paritok augmentation: semantic tool-schema selection + Paritok-4B content
+# compression and history summarization.
+#
+# Deliberately light. The tool selector reuses the same fastembed/bge-small
+# backend as [relevance] rather than pulling sentence-transformers (and torch)
+# the way Paritok upstream does. The Paritok-4B model is *not* a dependency:
+# it is served over an OpenAI-compatible endpoint (Ollama or vLLM), so the only
+# client-side requirement is httpx, which is already core.
+paritok = [
+    "fastembed>=0.4.0",
+    "numpy>=1.24.0",
+]
 # Qdrant + Neo4j memory backend helpers
 memory-stack = [
     "mem0ai>=2.0.0,<3.0",
@@ -308,7 +320,7 @@ dev = [
 # who need standard accuracy benchmarks can install `lm-eval[api]` in their
 # benchmark environment separately.
 all = [
-    "headroom-ai[proxy,code,ml,memory,relevance,image,reports,otel,evals,voice,html,mcp,spreadsheet]",
+    "headroom-ai[proxy,code,ml,memory,relevance,image,reports,otel,evals,voice,html,mcp,spreadsheet,paritok]",
 ]
 # Sandbox: a lean proxy with ALL torch-free capability — for running Headroom in
 # a locked-down/low-resource sandbox and offloading heavy ML elsewhere.
@@ -327,7 +339,7 @@ all = [
 # Everything kept here is torch-free: code-aware compression (tree-sitter),
 # embedding relevance (fastembed), HTML/spreadsheet ingestion, reports, OTel.
 sandbox = [
-    "headroom-ai[proxy,code,relevance,reports,otel,html,mcp,spreadsheet]",
+    "headroom-ai[proxy,code,relevance,reports,otel,html,mcp,spreadsheet,paritok]",
 ]
 
 [project.scripts]

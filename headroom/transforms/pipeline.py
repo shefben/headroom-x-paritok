@@ -150,6 +150,74 @@ class TransformPipeline:
         if self.config.cache_aligner.enabled:
             transforms.append(CacheAligner(self.config.cache_aligner))
 
+        # 1.3 TOON re-encoding (opt-in). Deliberately the FIRST of the three
+        # tool-result stages: it is lossless, so shrinking a result here can
+        # take it below the size threshold at which pruning or masking would
+        # have replaced it outright. Reduce first, then decide what to drop.
+        if self.config.rollout.is_enabled("toon_encoding"):
+            from headroom.transforms.toon_encoding import ToonEncoder, ToonEncodingConfig
+
+            transforms.append(ToonEncoder(ToonEncodingConfig.from_env(enabled=True)))
+            logger.info("Pipeline using TOON re-encoding for uniform JSON tool results")
+
+        # 1.4 Tool-result pruning (opt-in). Runs before every compressor: a
+        # result this stage removes is one nothing downstream has to spend a
+        # model call, an embedding or a CCR entry on. Placed after CacheAligner
+        # so it can honour the frozen prefix, and it is safe there because its
+        # verdicts use a bounded lookahead and so never change turn to turn.
+        if self.config.rollout.is_enabled("tool_result_pruning"):
+            from headroom.transforms.tool_result_pruning import (
+                ToolResultPruner,
+                ToolResultPruningConfig,
+            )
+
+            transforms.append(
+                ToolResultPruner(ToolResultPruningConfig.from_env(enabled=True))
+            )
+            logger.info("Pipeline using tool-result pruning before compression")
+
+        # 1.45 Observation masking (opt-in). Runs AFTER pruning so pruning gets
+        # first refusal on every result: its verdicts are evidence-based and it
+        # abstains when unsure, whereas masking only knows how old a result is.
+        # Anything pruning already replaced carries a CCR marker, which masking
+        # skips, so the two never fight over the same block.
+        if self.config.rollout.is_enabled("observation_masking"):
+            from headroom.transforms.observation_masking import (
+                ObservationMasker,
+                ObservationMaskingConfig,
+            )
+
+            transforms.append(
+                ObservationMasker(ObservationMaskingConfig.from_env(enabled=True))
+            )
+            logger.info("Pipeline using age-based observation masking")
+
+        # 1.5 Paritok-4B content compression (opt-in).
+        # Placed after CacheAligner so the cached prefix is already assessed and
+        # this stage can honour it, and before ContentRouter so everything
+        # Paritok leaves behind still gets Headroom's full compressor suite.
+        # Paritok output carries a <<ccr:...>> marker, which ContentRouter reads
+        # as "already compressed" and skips — unless chaining is enabled, in
+        # which case this stage runs Kompress itself so retrieval stays lossless.
+        if self.config.rollout.is_enabled("paritok_content_compress"):
+            from headroom.paritok.transform import ParitokCompressor
+
+            transforms.append(
+                ParitokCompressor(
+                    chain_model=self.config.rollout.is_enabled("paritok_chain_model"),
+                )
+            )
+            logger.info("Pipeline using Paritok-4B content compression before ContentRouter")
+
+        # 1.6 Paritok history summarization (opt-in, independent of the above).
+        # Summarizes stale turns in place — never merges or drops messages, so
+        # the live-zone-only invariant from PR-B1 still holds.
+        if self.config.rollout.is_enabled("paritok_history_summarize"):
+            from headroom.paritok.history import ParitokHistorySummarizer
+
+            transforms.append(ParitokHistorySummarizer())
+            logger.info("Pipeline using Paritok-4B history summarization")
+
         # 2. Content-aware Compression
         # ContentRouter handles ALL content types intelligently:
         # - JSON arrays -> SmartCrusher

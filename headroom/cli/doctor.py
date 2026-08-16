@@ -425,6 +425,54 @@ def check_savings(stats: dict[str, Any] | None, savings_file: Path) -> CheckResu
     return CheckResult(name=name, status=PASS, summary=f"{summary} ({source})")
 
 
+def check_paritok() -> CheckResult | None:
+    """Are the enabled Paritok levers actually usable?
+
+    Returns ``None`` when no lever is enabled, so the check stays invisible to
+    everyone who is not using Paritok. When a lever *is* on, a missing backend
+    is the difference between "compressing" and "silently passing through", so
+    it is worth surfacing loudly.
+    """
+    from headroom.paritok.config import PARITOK_FEATURES
+    from headroom.rollout import feature_enabled
+
+    enabled = [name for name in PARITOK_FEATURES if feature_enabled(name)]
+    if not enabled:
+        return None
+
+    name = "paritok"
+    short = ", ".join(n.removeprefix("paritok_") for n in enabled)
+    problems: list[str] = []
+
+    # The tool filter needs embeddings; the model levers need the backend.
+    if "paritok_tool_filter" in enabled:
+        from headroom.paritok.tool_filter import embeddings_available
+
+        if not embeddings_available():
+            problems.append("embedding model unavailable")
+
+    needs_model = {"paritok_content_compress", "paritok_history_summarize"}
+    if needs_model & set(enabled):
+        from headroom.paritok.config import resolve_paritok_config
+        from headroom.paritok.engine import ParitokEngine
+
+        config = resolve_paritok_config()
+        if not ParitokEngine(config).is_available(refresh=True):
+            problems.append(f"model backend unreachable at {config.endpoint}")
+
+    if problems:
+        return CheckResult(
+            name=name,
+            status=WARN,
+            summary=f"{short} enabled but {'; '.join(problems)} — passing through uncompressed",
+            hint=(
+                'install the extra: pip install "headroom-ai[paritok]"; '
+                "serve the model: ollama pull paritok/paritok-4b-v1"
+            ),
+        )
+    return CheckResult(name=name, status=PASS, summary=f"{short} enabled and ready")
+
+
 def check_budget(stats: dict[str, Any] | None) -> CheckResult:
     """Is a spend budget configured on the proxy?"""
     name = "budget"
@@ -588,6 +636,10 @@ def doctor(port: int, emit_json: bool) -> None:
     deployments = check_deployments(list_manifests())
     if deployments is not None:
         checks.append(deployments)
+    # Only reported when at least one Paritok lever is enabled.
+    paritok = check_paritok()
+    if paritok is not None:
+        checks.append(paritok)
 
     if any(c.status == FAIL for c in checks):
         exit_code = 2

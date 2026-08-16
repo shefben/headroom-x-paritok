@@ -759,8 +759,20 @@ def _compact_openai_responses_tools(
     payload: dict[str, Any],
 ) -> tuple[dict[str, Any], bool, int, int]:
     from headroom.proxy.tool_schema_compaction import compact_tools
+    from headroom.proxy.tool_schema_compilation import compile_tools_payload
 
-    return compact_tools(payload)
+    compacted, modified, before, after = compact_tools(payload)
+
+    # Notation pass, opt-in and inert when its feature is off. Chained here so
+    # the Responses path gets it without a second call site: it reports its own
+    # byte counts, but the pair reported outward must span both passes or the
+    # savings ledger would attribute only the last one.
+    compiled, compiled_modified, _compile_before, compile_after = compile_tools_payload(
+        compacted
+    )
+    if not compiled_modified:
+        return compacted, modified, before, after
+    return compiled, True, before or _compile_before, compile_after
 
 
 def _responses_request_allows_memory_tool_continuation(payload: dict[str, Any]) -> bool:
@@ -3773,12 +3785,64 @@ class OpenAIHandlerMixin:
         tool_tokens_before_compaction = 0
         tool_tokens_after_compaction = 0
         if _decision.should_compress and not _bypass and tools is not None:
+            # Layer 0: Paritok semantic tool selection (opt-in via
+            # PARITOK_TOOL_FILTER), same placement as the Anthropic handler —
+            # selection removes whole schemas, the compaction below shrinks the
+            # survivors, so this order avoids compacting schemas about to go.
+            try:
+                from headroom.paritok.tool_stage import tool_filter_enabled
+
+                _paritok_filter_on = tool_filter_enabled()
+            except Exception:  # pragma: no cover - defensive; selection is optional
+                _paritok_filter_on = False
+
+            if _paritok_filter_on:
+                try:
+                    from headroom.paritok.tool_stage import (
+                        last_assistant_text,
+                        select_tools,
+                    )
+                    from headroom.utils import extract_user_query
+
+                    _sel_payload, _sel_modified, _sel_before, _sel_after = select_tools(
+                        {"tools": tools},
+                        session_id=openai_session_id or "",
+                        query=extract_user_query(optimized_messages) or "",
+                        wire="openai_chat",
+                        assistant_text=last_assistant_text(optimized_messages),
+                    )
+                    if _sel_modified:
+                        # Seed the tool-token ledger from the *pre-selection*
+                        # array. The compaction pass below seeds it too, but by
+                        # then `tools` is already the selected subset, so
+                        # everything selection removed would be invisible in
+                        # `tool_schema_tokens_saved`.
+                        tool_tokens_before_compaction = tokenizer.count_text(
+                            _json_debug_dumps(tools)
+                        )
+                        tools = _sel_payload["tools"]
+                        transforms_applied.append("paritok:tool_selection")
+                        logger.debug(
+                            "[%s] paritok tool selection: %d -> %d bytes",
+                            request_id,
+                            _sel_before,
+                            _sel_after,
+                        )
+                except Exception as _sel_exc:  # never fail a request over selection
+                    logger.warning("[%s] paritok tool selection FAILED: %s", request_id, _sel_exc)
+
             try:
                 compacted_tool_payload, tools_modified, _, _ = _compact_openai_responses_tools(
                     {"tools": tools}
                 )
                 if tools_modified and compacted_tool_payload.get("tools") is not None:
-                    tool_tokens_before_compaction = tokenizer.count_text(_json_debug_dumps(tools))
+                    # Seed "before" only if selection above didn't; the passes
+                    # chain, so re-seeding here would discard what selection
+                    # removed. Same guard the description pass below uses.
+                    if not tool_tokens_before_compaction:
+                        tool_tokens_before_compaction = tokenizer.count_text(
+                            _json_debug_dumps(tools)
+                        )
                     tools = compacted_tool_payload["tools"]
                     if "openai:chat:tool_schema_compaction" not in transforms_applied:
                         transforms_applied.append("openai:chat:tool_schema_compaction")

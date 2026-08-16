@@ -114,6 +114,103 @@ FEATURES: dict[str, FeatureSpec] = {
         legacy_env=("HEADROOM_READ_MATURATION",),
         description="Hold-back Read maturation before provider cache entry.",
     ),
+    # Token levers below are all STABLE for the same reason: each is opt-in and
+    # inert when off, so a stock proxy's request path is byte-identical whether
+    # or not the feature exists. Gating them behind a channel would only make
+    # them unreachable without buying any safety.
+    #
+    # Prune tool results the transcript proves the model never used. Bounded
+    # lookahead keeps every verdict stable across turns, so it cannot churn the
+    # cached prefix.
+    "tool_result_pruning": FeatureSpec(
+        name="tool_result_pruning",
+        available_in=RolloutChannel.STABLE,
+        legacy_env=("HEADROOM_TOOL_RESULT_PRUNING",),
+        description="Prune superseded, empty and unreferenced tool results before compression.",
+    ),
+    # Provider-side lever: asks Anthropic to clear stale tool_use/tool_result
+    # pairs itself. The provider applies the edit AFTER its own cache lookup, so
+    # unlike every client-side history rewrite, enabling it cannot cost a cache
+    # miss on the turn it is switched on.
+    "anthropic_context_editing": FeatureSpec(
+        name="anthropic_context_editing",
+        available_in=RolloutChannel.STABLE,
+        legacy_env=("HEADROOM_CONTEXT_EDITING",),
+        description="Server-side clear_tool_uses context editing on Anthropic requests.",
+    ),
+    # Second provider-side lever. Summarises rather than deletes, and unlike
+    # context editing it needs the client to echo the compaction block back —
+    # hence the model-family gate in proxy/context_compaction.py on top of this
+    # flag.
+    "anthropic_context_compaction": FeatureSpec(
+        name="anthropic_context_compaction",
+        available_in=RolloutChannel.STABLE,
+        legacy_env=("HEADROOM_CONTEXT_COMPACTION",),
+        description="Server-side compact_20260112 compaction on Anthropic requests.",
+    ),
+    # Age-based masking of old tool observations. Complements tool_result_pruning:
+    # pruning removes what the transcript proves went unused, masking removes
+    # what is simply old.
+    "observation_masking": FeatureSpec(
+        name="observation_masking",
+        available_in=RolloutChannel.STABLE,
+        legacy_env=("HEADROOM_OBSERVATION_MASKING",),
+        description="Mask tool observations older than a fixed window, keeping them retrievable.",
+    ),
+    # Lossless re-serialisation of uniform JSON tool results. Pure function of
+    # the block, so it needs none of the cache-stability machinery the other
+    # tool-result stages carry.
+    "toon_encoding": FeatureSpec(
+        name="toon_encoding",
+        available_in=RolloutChannel.STABLE,
+        legacy_env=("HEADROOM_TOON_ENCODING",),
+        description="Re-serialise uniform JSON tool results as TOON before compression.",
+    ),
+    # Notation lever on the tools array, orthogonal to the lexical compactor and
+    # to semantic selection.
+    "tool_schema_compilation": FeatureSpec(
+        name="tool_schema_compilation",
+        available_in=RolloutChannel.STABLE,
+        legacy_env=("HEADROOM_TOOL_SCHEMA_COMPILATION",),
+        description="Compile JSON tool schemas into compact signature notation.",
+    ),
+    # Quality lever rather than a savings lever: restates the user's current
+    # task at the tail of a long transcript, where it costs no cache.
+    "task_reminder": FeatureSpec(
+        name="task_reminder",
+        available_in=RolloutChannel.STABLE,
+        legacy_env=("HEADROOM_TASK_REMINDER",),
+        description="Reinject the user's current task at the tail of long transcripts.",
+    ),
+    # Paritok augmentation levers. Available on every channel because each is
+    # independently opt-in and inert when off; none changes behavior by default.
+    "paritok_tool_filter": FeatureSpec(
+        name="paritok_tool_filter",
+        available_in=RolloutChannel.STABLE,
+        legacy_env=("PARITOK_TOOL_FILTER",),
+        description="Semantic top-k tool-schema selection before schema compaction.",
+    ),
+    "paritok_content_compress": FeatureSpec(
+        name="paritok_content_compress",
+        available_in=RolloutChannel.STABLE,
+        legacy_env=("PARITOK_CONTENT_COMPRESS",),
+        description="Paritok-4B content compression ahead of ContentRouter.",
+    ),
+    "paritok_history_summarize": FeatureSpec(
+        name="paritok_history_summarize",
+        available_in=RolloutChannel.STABLE,
+        legacy_env=("PARITOK_HISTORY_SUMMARIZE",),
+        description="Paritok-4B summarization of stale conversation turns.",
+    ),
+    # No ref-expand lever: Paritok compression writes into Headroom's own
+    # CompressionStore behind native <<ccr:HASH>> markers, so ccr.tool_injection
+    # already advertises headroom_retrieve for it. See headroom/paritok/config.py.
+    "paritok_chain_model": FeatureSpec(
+        name="paritok_chain_model",
+        available_in=RolloutChannel.STABLE,
+        legacy_env=("PARITOK_CHAIN_MODEL",),
+        description="Re-compress Paritok-4B output through Headroom's Kompress model.",
+    ),
 }
 
 

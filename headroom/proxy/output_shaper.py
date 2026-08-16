@@ -17,6 +17,15 @@ output tokens, so every lever here works by reshaping the request:
    asks we leave it alone. For legacy models still sending
    ``thinking.budget_tokens`` we clamp the budget to the API floor instead.
 
+3. Edit-format steering — the largest avoidable output on a coding agent is a
+   model re-emitting code it was not asked to change: a whole-file write where
+   a three-line edit would do, a function pasted back "for context", a recap
+   restating the diff. Aider measured the same effect in reverse when it moved
+   GPT-4 Turbo from whole-file to unified diffs and the model became "3x less
+   lazy". Off by default and gated on the request actually exposing a
+   file-editing tool, so it never spends bytes on an agent that cannot use it.
+   See :mod:`headroom.proxy.output_edit_format_policy`.
+
 Safety rules (each prevents a concrete failure mode):
 - Never INJECT ``output_config.effort`` where the client didn't send it —
   models without effort support 400 on it. Lowering an existing value is
@@ -44,9 +53,15 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import dataclass
+from collections.abc import Callable
 from typing import Any
 
 from headroom.proxy import runtime_env
+from headroom.proxy.edit_format_steering import (
+    apply_edit_format_steering,
+    apply_openai_chat_edit_format_steering,
+    apply_openai_responses_edit_format_steering,
+)
 from headroom.proxy.output_effort_policy import (
     EFFORT_RANK as _EFFORT_RANK,
 )
@@ -103,6 +118,10 @@ class OutputShaperSettings:
     verbosity_level: int = 2
     effort_router_enabled: bool = True
     mechanical_effort: str = "low"
+    edit_format_mode: str = "off"
+    """``off`` / ``minimal`` / ``strict``. Off by default: the block only pays
+    for itself on agents that actually edit files, and its wording is part of
+    the cached system prefix (see ``output_edit_format_policy``)."""
 
     @classmethod
     def from_env(cls, *, enabled: bool | None = None) -> OutputShaperSettings:
@@ -131,11 +150,19 @@ class OutputShaperSettings:
         mech = runtime_env.getenv("HEADROOM_MECHANICAL_EFFORT", "low")
         if mech not in _EFFORT_RANK:
             mech = "low"
+        from headroom.proxy.output_edit_format_policy import (
+            EDIT_FORMAT_MODE_ENV,
+            resolve_edit_format_mode,
+        )
+
         return cls(
             enabled=enabled,
             verbosity_level=level,
             effort_router_enabled=router,
             mechanical_effort=mech,
+            edit_format_mode=resolve_edit_format_mode(
+                runtime_env.getenv(EDIT_FORMAT_MODE_ENV, "")
+            ),
         )
 
 
@@ -288,6 +315,26 @@ def route_openai_text_verbosity(body: dict[str, Any]) -> list[str]:
     return []
 
 
+def _apply_edit_format(
+    body: dict[str, Any],
+    settings: OutputShaperSettings,
+    tools: Any,
+    injector: Callable[[dict[str, Any], str], bool],
+) -> bool:
+    """Run the edit-format injector when the request can act on the advice.
+
+    Shared by all three wire formats so the gate cannot drift between them:
+    mode must be on, and the request must expose a tool that edits files.
+    """
+    if settings.edit_format_mode == "off":
+        return False
+    from headroom.proxy.output_edit_format_policy import request_has_edit_tools
+
+    if not request_has_edit_tools(tools):
+        return False
+    return injector(body, settings.edit_format_mode)
+
+
 def shape_openai_responses_request(
     body: dict[str, Any],
     settings: OutputShaperSettings | None = None,
@@ -306,6 +353,12 @@ def shape_openai_responses_request(
     if level > 0 and apply_openai_responses_verbosity_steering(body, level):
         result.changed = True
         result.labels.append(f"output_shaper:verbosity:L{level}")
+
+    if _apply_edit_format(
+        body, settings, body.get("tools"), apply_openai_responses_edit_format_steering
+    ):
+        result.changed = True
+        result.labels.append(f"output_shaper:edit_format:{settings.edit_format_mode}")
 
     kind = classify_openai_responses_input(body.get("input"))
     if settings.effort_router_enabled:
@@ -347,6 +400,13 @@ def shape_request(
         result.changed = True
         result.labels.append(f"output_shaper:verbosity:L{level}")
 
+    # Edit-format steering: the output-token lever. Gated on the request
+    # actually exposing file-editing tools — telling an agent that cannot edit
+    # a file to prefer small edits is bytes spent on nothing.
+    if _apply_edit_format(body, settings, body.get("tools"), apply_edit_format_steering):
+        result.changed = True
+        result.labels.append(f"output_shaper:edit_format:{settings.edit_format_mode}")
+
     if settings.effort_router_enabled:
         kind = classify_turn(body.get("messages", []))
         labels = route_effort(body, kind, settings)
@@ -384,6 +444,12 @@ def shape_openai_chat_request(
     if level > 0 and apply_openai_chat_verbosity_steering(body, level):
         result.changed = True
         result.labels.append(f"output_shaper:verbosity:L{level}")
+
+    if _apply_edit_format(
+        body, settings, body.get("tools"), apply_openai_chat_edit_format_steering
+    ):
+        result.changed = True
+        result.labels.append(f"output_shaper:edit_format:{settings.edit_format_mode}")
 
     return result
 

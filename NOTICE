@@ -55,3 +55,19 @@ https://github.com/bigskysoftware/htmx
 Alpine.js 3.13.3 — MIT License
 Copyright (c) 2019-2025 Caleb Porzio and contributors
 https://github.com/alpinejs/alpine
+
+Paritok (headroom/paritok/)
+---------------------------
+Portions of headroom/paritok/ are derived from the Paritok compression
+gateway, and headroom/paritok/system_prompts/*.txt are verbatim copies of
+the Paritok training system prompts.
+Copyright (c) Paritok Team
+Licensed under the Apache License, Version 2.0
+https://github.com/Paritok-official/paritok-4b-v1
+
+The Paritok-4B model itself is NOT distributed with Headroom; it is served
+separately over an OpenAI-compatible endpoint (Ollama or vLLM). The model is
+a LoRA adapter over Qwen/Qwen3-4B-Instruct-2507, which carries its own
+license terms — review them before deploying the model.
+https://huggingface.co/paritok/paritok-4b-v1
+https://huggingface.co/Qwen/Qwen3-4B-Instruct-2507

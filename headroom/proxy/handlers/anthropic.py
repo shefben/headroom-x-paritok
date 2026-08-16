@@ -2458,6 +2458,60 @@ class AnthropicHandlerMixin:
                 except Exception:
                     return 0
 
+            # Layer 0: Paritok semantic tool selection (opt-in via
+            # PARITOK_TOOL_FILTER). Runs before the compaction layers below:
+            # selection drops whole schemas, compaction shrinks the survivors,
+            # so doing it in this order avoids compacting schemas that are about
+            # to be discarded. The selection is frozen per session, keeping the
+            # tools array byte-stable for the provider's prefix cache.
+            #
+            # The previous assistant turn is passed in so a withheld schema can
+            # be restored: if the agent replied that it lacked a capability,
+            # that text is sitting in `messages` right now, and recovering here
+            # covers streaming and non-streaming with one code path.
+            try:
+                from headroom.paritok.tool_stage import tool_filter_enabled
+
+                _paritok_filter_on = tool_filter_enabled()
+            except Exception:  # pragma: no cover - defensive; selection is optional
+                _paritok_filter_on = False
+
+            if _paritok_filter_on:
+                try:
+                    from headroom.paritok.tool_stage import (
+                        last_assistant_text,
+                        select_tools,
+                    )
+
+                    _pre_selection_tools = body.get("tools")
+                    body, _sel_modified, _sel_before, _sel_after = select_tools(
+                        body,
+                        session_id=session_id,
+                        query=extract_user_query(messages) or "",
+                        wire="anthropic",
+                        assistant_text=last_assistant_text(messages),
+                    )
+                    if _sel_modified:
+                        tools = body["tools"]
+                        transforms_applied.append("paritok:tool_selection")
+                        # Seed the ledger from the pre-selection array. The
+                        # compaction pass below seeds it too, but by then the
+                        # dropped schemas are gone from `body["tools"]`, so
+                        # everything selection saved would go unreported.
+                        _tool_tokens_before = _count_tool_tokens(_pre_selection_tools)
+                        _tool_tokens_after = _count_tool_tokens(tools)
+                        logger.debug(
+                            "[%s] paritok tool selection: %d -> %d bytes (%.0f%% saved)",
+                            request_id,
+                            _sel_before,
+                            _sel_after,
+                            (1 - _sel_after / max(_sel_before, 1)) * 100,
+                        )
+                except Exception as _sel_exc:
+                    logger.warning(
+                        "[%s] paritok tool selection FAILED: %s", request_id, _sel_exc
+                    )
+
             _tools_compaction_started = time.time()
             try:
                 from headroom.proxy.tool_schema_compaction import compact_tools
@@ -2467,7 +2521,10 @@ class AnthropicHandlerMixin:
                 if _tools_modified:
                     tools = body["tools"]
                     transforms_applied.append("anthropic:tool_schema_compaction")
-                    _tool_tokens_before = _count_tool_tokens(_pre_compaction_tools)
+                    # Seed "before" only if selection above didn't; the passes
+                    # chain, so "after" always tracks the latest tools.
+                    if not _tool_tokens_before:
+                        _tool_tokens_before = _count_tool_tokens(_pre_compaction_tools)
                     _tool_tokens_after = _count_tool_tokens(tools)
                     _tools_compaction_ms = (time.time() - _tools_compaction_started) * 1000
                     logger.debug(
@@ -2519,6 +2576,37 @@ class AnthropicHandlerMixin:
                 _desc_modified = False
                 logger.warning(
                     "[%s] tool desc compaction FAILED: %s", request_id, _desc_compaction_exc
+                )
+
+            # Layer 4: Tool-schema compilation (opt-in via the
+            # `tool_schema_compilation` rollout feature). Runs last of the tool
+            # layers so it compiles schemas the lexical passes have already
+            # cleaned — a description this stage folds into a signature line is
+            # one Layer 1 has already whitespace-normalised. Notation only: the
+            # tool keeps its name, its parameters and their meaning.
+            try:
+                from headroom.proxy.tool_schema_compilation import compile_tools_payload
+
+                _pre_compile_tools = body.get("tools")
+                body, _compile_modified, _compile_before, _compile_after = (
+                    compile_tools_payload(body)
+                )
+                if _compile_modified:
+                    tools = body["tools"]
+                    transforms_applied.append("anthropic:tool_schema_compilation")
+                    if not _tool_tokens_before:
+                        _tool_tokens_before = _count_tool_tokens(_pre_compile_tools)
+                    _tool_tokens_after = _count_tool_tokens(tools)
+                    logger.debug(
+                        "[%s] tool schema compilation: %d -> %d bytes (%.0f%% saved)",
+                        request_id,
+                        _compile_before,
+                        _compile_after,
+                        (1 - _compile_after / max(_compile_before, 1)) * 100,
+                    )
+            except Exception as _compile_exc:
+                logger.warning(
+                    "[%s] tool schema compilation FAILED: %s", request_id, _compile_exc
                 )
 
             # Layer 3: System prompt compaction (opt-in via
@@ -2856,6 +2944,144 @@ class AnthropicHandlerMixin:
                                 f"[{request_id}] OutputShaper(L{_level}/{_src}): "
                                 f"{shape_result.labels}"
                             )
+
+            # Server-side context editing (opt-in via the `anthropic_context_editing`
+            # rollout feature / HEADROOM_CONTEXT_EDITING=1). Ask Anthropic to clear
+            # stale tool_use/tool_result pairs on its own side once the request
+            # crosses the trigger. Unlike every client-side history rewrite this
+            # costs no cache miss: the provider evaluates its prefix cache against
+            # the request as sent and applies the edit afterwards.
+            #
+            # FIRST-PARTY ANTHROPIC ONLY, same gate as the tool-search deferral
+            # above — `context_management` is an unknown body field to custom
+            # Anthropic-compatible gateways and they 400 on it.
+            _ctx_edit_applied = False
+            if (
+                provider_name == "anthropic"
+                and anthropic_first_party_tool_search_supported(_anthropic_target_base_url)
+                and getattr(self, "anthropic_backend", None) is None
+            ):
+                from headroom.proxy.context_editing import (
+                    CONTEXT_EDITING_BETA,
+                    ContextEditingSettings,
+                    apply_context_editing,
+                    context_editing_enabled,
+                )
+
+                _ctx_result = (
+                    apply_context_editing(body, ContextEditingSettings.from_env(enabled=True))
+                    if context_editing_enabled()
+                    else None
+                )
+                if _ctx_result is not None and _ctx_result.applied:
+                    _ctx_edit_applied = True
+                    body_mutation_tracker.mark_mutated("context_editing")
+                    tags["context_editing_tool_uses"] = _ctx_result.tool_use_count
+                    transforms_applied.append(
+                        f"provider:context_editing:{_ctx_result.tool_use_count}tooluses"
+                    )
+                    # The edit is inert without the beta token. Merge rather than
+                    # assign so the session-sticky baseline (and the memory tool's
+                    # copy of this same token) survive.
+                    from headroom.proxy.helpers import merge_anthropic_beta
+
+                    _merged_beta = merge_anthropic_beta(
+                        headers.get("anthropic-beta", ""), [CONTEXT_EDITING_BETA]
+                    )
+                    if _merged_beta != headers.get("anthropic-beta", ""):
+                        headers["anthropic-beta"] = _merged_beta
+                        _headroom_beta_added = True
+                    logger.info(
+                        "[%s] ContextEditing: requested clear_tool_uses "
+                        "(tool_uses=%d, trigger=%s)",
+                        request_id,
+                        _ctx_result.tool_use_count,
+                        (_ctx_result.edit or {}).get("trigger"),
+                    )
+                elif _ctx_result is not None and _ctx_result.reason not in (
+                    "disabled",
+                    "below_keep_threshold",
+                ):
+                    logger.debug(
+                        "[%s] ContextEditing: skipped (%s)", request_id, _ctx_result.reason
+                    )
+
+                # Server-side compaction (opt-in via `anthropic_context_compaction`
+                # / HEADROOM_CONTEXT_COMPACTION=1). Shares the first-party gate
+                # above and merges into the same `context_management.edits`
+                # array, so a request may legitimately carry both levers.
+                #
+                # Requires the client to echo the returned compaction block back
+                # on the next turn. A client that drops it loses the benefit but
+                # is not broken; see the module docstring.
+                from headroom.proxy.context_compaction import (
+                    COMPACTION_BETA,
+                    CompactionSettings,
+                    apply_compaction,
+                    compaction_enabled,
+                )
+
+                _compact_result = (
+                    apply_compaction(
+                        body,
+                        CompactionSettings.from_env(enabled=True),
+                        model=model,
+                    )
+                    if compaction_enabled()
+                    else None
+                )
+                if _compact_result is not None and _compact_result.applied:
+                    body_mutation_tracker.mark_mutated("context_compaction")
+                    transforms_applied.append("provider:context_compaction")
+                    from headroom.proxy.helpers import merge_anthropic_beta
+
+                    _compact_beta = merge_anthropic_beta(
+                        headers.get("anthropic-beta", ""), [COMPACTION_BETA]
+                    )
+                    if _compact_beta != headers.get("anthropic-beta", ""):
+                        headers["anthropic-beta"] = _compact_beta
+                        _headroom_beta_added = True
+                    logger.info(
+                        "[%s] ContextCompaction: requested compact_20260112 (trigger=%s)",
+                        request_id,
+                        (_compact_result.edit or {}).get("trigger"),
+                    )
+                elif _compact_result is not None and _compact_result.reason != "disabled":
+                    logger.debug(
+                        "[%s] ContextCompaction: skipped (%s)",
+                        request_id,
+                        _compact_result.reason,
+                    )
+
+            # Task reinjection (opt-in via the `task_reminder` rollout feature).
+            # Appends a restatement of the user's current request to the TAIL of
+            # the message array — after every cache_control breakpoint, so it
+            # costs nothing in cache terms — when the instruction has drifted far
+            # enough back to have decayed. Provider-agnostic: this is message
+            # content, not a body field, so no first-party gate applies.
+            try:
+                from headroom.proxy.task_reminder import (
+                    TaskReminderSettings,
+                    apply_task_reminder,
+                    task_reminder_enabled,
+                )
+
+                if task_reminder_enabled():
+                    _reminder_task = apply_task_reminder(
+                        body,
+                        TaskReminderSettings.from_env(enabled=True),
+                        input_tokens=original_tokens,
+                    )
+                    if _reminder_task is not None:
+                        body_mutation_tracker.mark_mutated("task_reminder")
+                        transforms_applied.append("task_reminder")
+                        logger.debug(
+                            "[%s] TaskReminder: reinjected %d chars at tail",
+                            request_id,
+                            len(_reminder_task),
+                        )
+            except Exception as _reminder_exc:  # noqa: BLE001 - never fail a request
+                logger.warning("[%s] task reminder FAILED: %s", request_id, _reminder_exc)
 
             # Unit 2: mark end of pre-upstream phase. Everything after this
             # point is upstream I/O or post-response bookkeeping.
@@ -3763,6 +3989,33 @@ class AnthropicHandlerMixin:
                                 usage
                             )
                             uncached_input_tokens = int(usage.get("input_tokens", 0) or 0)
+
+                            # Provider-side context editing reports what it actually
+                            # cleared. Record it as a tag rather than folding it into
+                            # `tokens_saved`: the proxy never sent those bytes upstream
+                            # this turn, so adding them to the client-side savings total
+                            # would double-count against `original_tokens`.
+                            if _ctx_edit_applied:
+                                from headroom.proxy.context_editing import (
+                                    cleared_input_tokens as _ctx_cleared_input_tokens,
+                                )
+                                from headroom.proxy.context_editing import (
+                                    cleared_tool_uses as _ctx_cleared_tool_uses,
+                                )
+
+                                _ctx_cleared = _ctx_cleared_input_tokens(usage)
+                                if _ctx_cleared > 0:
+                                    tags["context_editing_cleared_tokens"] = _ctx_cleared
+                                    tags["context_editing_cleared_tool_uses"] = (
+                                        _ctx_cleared_tool_uses(usage)
+                                    )
+                                    logger.info(
+                                        "[%s] ContextEditing: provider cleared %d input "
+                                        "tokens across %d tool uses",
+                                        request_id,
+                                        _ctx_cleared,
+                                        tags["context_editing_cleared_tool_uses"],
+                                    )
 
                         # Track cache bust: tokens that lost their cache discount due to compression.
                         # If we had X tokens cached last turn and only Y hit cache this turn,
